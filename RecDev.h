@@ -9,6 +9,9 @@
 ******************************************************************************/
 #ifndef __REC_DEV_H
 #define __REC_DEV_H
+#ifdef SUPPORT_EX_PREINCLUDE//不支持Preinlude時
+  #include "Preinclude.h"
+#endif
 
 /******************************************************************************
                               相关配置
@@ -39,8 +42,8 @@ struct _RecDev{
   struct _RecDevDesc Desc;           //保存结构描述(直接缓冲以加快程序执行)]
   unsigned char WrBuf[REC_DEV_BUF_SIZE]; //写专用缓冲
   unsigned char RdBuf[REC_DEV_BUF_SIZE]; //读专用缓冲 
+  unsigned char Looped;                  //回环标志  
   RecDevAdr_t NextWrPos;                  //下次写入位置(不用最后写入以方便写前判断)  
-  unsigned char Looped;                  //回环标志
 };
 
 /******************************************************************************

@@ -2,7 +2,7 @@
 
               记录专用底层驱动程序-在Flash中的实现
 驱动在写时，保证续还一条记录的空间为全1，以此保证回环后能查找到起始位置
-存储区以记录长度为标志对齐，每页(FLASH_PAGE_SIZE)数据对齐
+存储区以记录长度为标志对齐，每页(FLASH_PAGE_SIZE, <=65535)数据对齐
 注：记录地址起始与结束，必须为Flash一页的起始与结束！！
 ******************************************************************************/
 
@@ -17,6 +17,9 @@
 
 #include  "Flash.h"  //依赖此接口以操作Flash
 #include <string.h>
+
+#define LastWrPos   NextWrPos //另名，这里使用的是上次位置，而不是下次
+
 
 //-------------------------写flash函数--------------------------------
 void _WrFlash(unsigned long Adr,   //Flash地址
@@ -149,7 +152,7 @@ void RecDev_Wr(struct _RecDev *pDev)
 }
 
 //------------------------得到已保存记录总数---------------------------
-unsigned short RecDev_GetCount(struct _RecDev *pDev)
+unsigned short RecDev_GetCount(const struct _RecDev *pDev)
 {
   unsigned char FrameSize = pDev->Desc.FrameSize;
   if(pDev->Looped){//回环了
