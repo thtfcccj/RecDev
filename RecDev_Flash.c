@@ -2,24 +2,13 @@
 
               记录专用底层驱动程序-在Flash中的实现
 驱动在写时，保证续还一条记录的空间为全1，以此保证回环后能查找到起始位置
-存储区以记录长度为标志对齐，每页(FLASH_PAGE_SIZE, <=65535)数据对齐
+每个存储区以记录长度对齐，若取模有余数，则丢弃!
 注：记录地址起始与结束，必须为Flash一页的起始与结束！！
 ******************************************************************************/
-
-//-------------------------Flash实现与Eeprom实现的异同-------------------------
-//相同处：
-//   均是空间连续存储，故初始化与读取记录操作相同(仅调用读写函数不同)
-//不同点:
-//因Flash只能一个扇区擦除，故格式化不同
-//flash存在一条记录跨越两个扇区问题，且清下一条记录变成了格式化下个扇区，故写有很大不同
-
 #include "RecDev.h"
 
 #include  "Flash.h"  //依赖此接口以操作Flash
 #include <string.h>
-
-#define LastWrPos   NextWrPos //另名，这里使用的是上次位置，而不是下次
-
 
 //-------------------------写flash函数--------------------------------
 void _WrFlash(unsigned long Adr,   //Flash地址
@@ -57,14 +46,21 @@ void RecDev_Init(struct _RecDev *pDev, const struct _RecDevDesc *pDesc)
   
   unsigned char FrameSize = pDev->Desc.FrameSize;
   RecDevAdr_t Start = pDev->Desc.Start; 
-  Flash_Read(Start, pDev->RdBuf, FrameSize);//先读首条记录到读缓冲区
-  if(!_RdBufIsValid(pDev)){//首条数据无效，认为刚初始化从来没用过
-    pDev->LastWrPos = Start;
-    return;
+  RecDevAdr_t End = pDev->Desc.End;   
+  //先查找到每个扇区是否有第一条记录
+  for(; Start < End; Start += FLASH_PAGE_SIZE){
+    Flash_Read(Start, pDev->RdBuf, FrameSize);
+    if(!_RdBufIsValid(pDev)) break; //首条有数据了
   }
-  //采用中值法查找记录最后一条写记录位置
+  if(Start >= End) Start-= FLASH_PAGE_SIZE;//在最后一页了
+  else{//前几页需检查回环:下一页有数据时，即认为回环了
+    Flash_Read(Start + FLASH_PAGE_SIZE, pDev->RdBuf, FrameSize);
+    pDev->Looped = 1;//置回环标志
+  }
+   
+  //采用中值法查找当前页最后一条写记录位置
   unsigned short FindMin = 0;  
-  unsigned short RecCount = (pDev->Desc.End - Start) / FrameSize;
+  unsigned short RecCount = FLASH_PAGE_SIZE / FrameSize;
   unsigned short FindMax = RecCount;
   unsigned short FindMid = RecCount / 2;
   while((FindMax - 1) > FindMin){
@@ -75,19 +71,7 @@ void RecDev_Init(struct _RecDev *pDev, const struct _RecDevDesc *pDesc)
       FindMin = FindMid;
     FindMid = (FindMax + FindMin) / 2;
   }
-  //得到是否回环：读取页最后一个记录,若有数据，则回环了
-  RecDevAdr_t RdPos = pDev->Desc.End - ((pDev->Desc.End - Start) % FrameSize);
-  RdPos -= FrameSize;//页最后记录位置
-  Flash_Read(RdPos, pDev->RdBuf, FrameSize);
-  if(_RdBufIsValid(pDev)){//有数时
-    pDev->Looped = 1;//置回环标志
-  }
-  
-  //初始化写头
-  if(FindMax == RecCount)//全满异常:在清最后一条记录时失败，暂从前开始
-    pDev->LastWrPos = Start;//得到写位置
-  else
-    pDev->LastWrPos = (FindMax * FrameSize) + Start;//得到写位置
+  pDev->NextWrPos = Start + (FindMax * FrameSize);//得到写位置
 }
 
 //-----------------------格式化记录区函数--------------------------------
@@ -108,14 +92,16 @@ void RecDev_Format(struct _RecDev *pDev)
 static RecDevAdr_t _GetWrPos(struct _RecDev *pDev)
 {
   unsigned char FrameSize = pDev->Desc.FrameSize;
-  // * 2为准备写入的结束位置
-  RecDevAdr_t WrPos = pDev->LastWrPos + FrameSize * 2; 
-  if(WrPos > pDev->Desc.End){//回环了
-    pDev->Looped = 1;
-    WrPos = pDev->Desc.Start;
-    _FormatFlash(pDev->Desc.Start); //提前格式化
+  // * 1为准备写入的结束位置, 不够不写了，直接查回环
+  RecDevAdr_t WrPos = pDev->NextWrPos; 
+  if((WrPos + FrameSize) >= pDev->Desc.End){//下次或本次不够，回环了
+    _FormatFlash(pDev->Desc.Start); //写入前，需提前格式化以留判断起始的空间
+    if((WrPos + FrameSize) > pDev->Desc.End){//最后记录不足一条了,丢弃
+      pDev->Looped = 1;//写到最后回环了
+      WrPos = pDev->Desc.Start;
+    }
+    //else 继续写最后一条记录，写完再处理
   }
-  else WrPos -= FrameSize; //本次写位置了
   return WrPos;
 }
 
@@ -123,51 +109,53 @@ static RecDevAdr_t _GetWrPos(struct _RecDev *pDev)
 void RecDev_Wr(struct _RecDev *pDev)
 {
   unsigned char FrameSize = pDev->Desc.FrameSize;
-  RecDevAdr_t WrPos = _GetWrPos(pDev);
-  //得到本扇区可写入字节数
-  unsigned short NextOffWrPos = (WrPos % FLASH_PAGE_SIZE) + FrameSize;//下次相对写入位置
-  unsigned char CurWrCount = FrameSize;
-  if(NextOffWrPos > FLASH_PAGE_SIZE){ //跨区了
-    CurWrCount -= (NextOffWrPos - FLASH_PAGE_SIZE); //本次可写入
-    _FormatFlash(WrPos + FrameSize);//提前格式化未整体写入的下一扇区
-  };
-  _WrFlash(WrPos, pDev->WrBuf, CurWrCount);
-  if(CurWrCount < FrameSize){//需写下半部分
-    _WrFlash(WrPos + CurWrCount, //下页起始
-             &pDev->WrBuf[CurWrCount], //未写入部分
-             FrameSize - CurWrCount);  //未写入部分总数
-    pDev->LastWrPos = WrPos; //写入成功
-  }
-  //无下半部分时，若回环，还需检查是否跨到下一页,是则提前格式化以准备
-  else if(pDev->Looped){
-    pDev->LastWrPos = WrPos; //提前更新下一页以_GetWrPos()
-    NextOffWrPos = (_GetWrPos(pDev) % FLASH_PAGE_SIZE) + FrameSize;//下下次相对写入位置
-    if(NextOffWrPos > FLASH_PAGE_SIZE){ //跨区了
-      _FormatFlash(WrPos + FrameSize);//提前格式化整体写入的下一扇区
+  //提前得到下次写入结束位置
+  RecDevAdr_t NextEnd = pDev->NextWrPos + FrameSize * 2;  
+  //本页最后一条记录时，提前格式化下一页，以防止期间关机
+  if((NextEnd % FLASH_PAGE_SIZE) >= FLASH_PAGE_SIZE){
+    if(NextEnd >= pDev->Desc.End){//写到最后回环了
+      NextEnd = pDev->Desc.Start;
+      pDev->Looped = 1;
     }
+    else //重新修正到下页起始
+      NextEnd = pDev->NextWrPos + FrameSize + FLASH_PAGE_SIZE % FrameSize; 
+    _FormatFlash(NextEnd);
   }
-  //例：FLASH_PAGE_SIZE = 1024, FrameSize = 5
-  //令pDev->LastWrPos= 1015： 本次写入位置1020->提前格式化下一页->4+1写 下:1025 
-  //令pDev->LastWrPos= 1104:  本次写入位置1019->5写->提前格式化下一页:1024
+  else NextEnd -= FrameSize;//本次结束位置
+  //写入本次记录
+  _WrFlash(pDev->NextWrPos, pDev->WrBuf, FrameSize);
+  pDev->NextWrPos = NextEnd;
+}
+
+//------------------------得到记录页数-------------------------------
+static unsigned char _GetPageCount(const struct _RecDev *pDev)
+{
+  return (pDev->Desc.End - pDev->Desc.Start) / FLASH_PAGE_SIZE;
+}
+
+//------------------------得到记录容量-------------------------------
+unsigned short RecDev_GetCapability(const struct _RecDev *pDev)
+{
+  //每页可记录总数
+  unsigned short PageRecCount = FLASH_PAGE_SIZE / pDev->Desc.FrameSize;
+  return PageRecCount * _GetPageCount(pDev);
 }
 
 //------------------------得到已保存记录总数---------------------------
 unsigned short RecDev_GetCount(const struct _RecDev *pDev)
 {
-  unsigned char FrameSize = pDev->Desc.FrameSize;
+  unsigned char FullPageCount; //已写满页总数
   if(pDev->Looped){//回环了
-    //需减掉正在写入页已被删除的记录
-    unsigned short MaxCount = (pDev->Desc.End - pDev->Desc.Start) / FrameSize;
-    unsigned short OffPos = pDev->LastWrPos % FLASH_PAGE_SIZE;//已保存的页内相对位置
-    MaxCount -= (FLASH_PAGE_SIZE - OffPos) / FrameSize;
-    return MaxCount - 1; //预留一个空位防止跨页问题。 
+    FullPageCount = _GetPageCount(pDev) - 1;//有一页未写满
   }
-  //没回环
-  return (pDev->LastWrPos - pDev->Desc.Start) / FrameSize;
-
-  //例：FLASH_PAGE_SIZE = 1024, FrameSize = 5, 共4页
-  //令pDev->LastWrPos= 1025 + 回环 个数为: 最大可能个数：(4095 / 5) = 819;
-  //819 - (1024 - (1025 % 1024)) / 5 -1 = 615(此为最小存储个数)
+  else{//没回环
+    FullPageCount = (pDev->NextWrPos - pDev->Desc.Start) / 
+                     FLASH_PAGE_SIZE;
+  }
+  //每页可记录总数
+  unsigned char FrameSize = pDev->Desc.FrameSize;   
+  return FullPageCount * (FLASH_PAGE_SIZE / FrameSize) + //已写入整页的
+         (pDev->NextWrPos % FLASH_PAGE_SIZE) / FrameSize;//未写满的
 }
 
 //-----------------------记录虚拟设备读函数-----------------------
@@ -177,15 +165,39 @@ const unsigned char *RecDev_Rd(struct _RecDev *pDev,
                                unsigned short RecId)
 {
   if(RecId >= RecDev_GetCount(pDev)) return NULL; //读位置超限
-  //最后写入位置是第一条
-  RecDevAdr_t RdPos = RecId * pDev->Desc.FrameSize + pDev->LastWrPos; //得到读偏移
-  if(RdPos > pDev->LastWrPos){ //回环了
-    RdPos -= pDev->LastWrPos; //获得需回环数量
-    //最后位置留下不能存放的
-    unsigned char Leave = (pDev->Desc.End - pDev->Desc.Start) % pDev->Desc.FrameSize;
-    RdPos =  pDev->Desc.End - (RdPos + Leave);
+  
+  unsigned char FrameSize = pDev->Desc.FrameSize; 
+  unsigned short CurPageRecCount = //当前正在写入页的记录总数
+                 (pDev->NextWrPos & FLASH_PAGE_SIZE) / FrameSize;
+  if(RecId < CurPageRecCount){//在写入页了
+    Flash_Read(pDev->NextWrPos - RecId * FrameSize, 
+               pDev->RdBuf, FrameSize);
+    return pDev->RdBuf;    
   }
-  else RdPos = pDev->LastWrPos - RdPos;
+  
+  //跨页了,先计算页位置
+  RecId -= CurPageRecCount;//整页对齐了
+  unsigned short PageRecCount = FLASH_PAGE_SIZE / FrameSize;//每页可记录总数
+  unsigned char WrPagePos = //写入位置页位，从此开始往前算
+                (pDev->NextWrPos - pDev->Desc.Start) / FLASH_PAGE_SIZE;
+  
+  //需要跨的页数转换到具体页数
+  unsigned char PagePos = RecId / PageRecCount;//需要跨的页数  
+  if(WrPagePos >= PagePos){//在pDev->Desc.Start后页，没有回环
+    PagePos = WrPagePos - PagePos;
+  }
+  else{//回环到最后了
+    PagePos = PagePos - WrPagePos;//需回环的页数
+    PagePos = _GetPageCount(pDev) - PagePos; //反向回环位置
+  }
+  //再计算记录位置
+  RecDevAdr_t RdPos = pDev->Desc.Start + PagePos * FLASH_PAGE_SIZE;//至某页了
+  RdPos += PageRecCount - (RecId % PageRecCount);//具体位置,倒着算
+  
   Flash_Read(RdPos, pDev->RdBuf, pDev->Desc.FrameSize);
   return pDev->RdBuf;
 }
+
+
+
+
