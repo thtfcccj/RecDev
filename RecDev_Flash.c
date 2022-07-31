@@ -78,7 +78,7 @@ void RecDev_Init(struct _RecDev *pDev, const struct _RecDevDesc *pDesc)
       FindMin = FindMid;
     FindMid = (FindMax + FindMin) / 2;
   }
-  if(FindMax == RecCount) Start = (RecCount - 1) * FrameSize;//最后一条了
+  if(FindMax == RecCount) Start += (RecCount - 1) * FrameSize;//最后一条了
   else Start += (FindMax * FrameSize);//中间位置
   pDev->NextWrPos = Start;
 }
